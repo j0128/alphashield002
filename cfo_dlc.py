@@ -4,19 +4,20 @@ import numpy as np
 import yfinance as yf
 import requests
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
 class AlphaStrategyDLC:
     def __init__(self):
-        self.version = "3.4 (Macro + OBV + Kelly)"
+        self.version = "3.7 (Macro + Kelly + Delist Mode)"
 
     # ==========================================
-    # 📡 宏觀數據引擎 (FRED + Yahoo)
+    # 📡 宏觀數據 (FRED + Market)
     # ==========================================
     def get_macro_regime(self, fred_key):
         """
         獲取宏觀狀態：
         1. 利率 (FRED DGS10)
-        2. 銅金比 (Copper/Gold Ratio) - 經濟晴雨表
+        2. 銅金比 (Copper/Gold) - 經濟體溫
         3. VIX - 恐慌指數
         """
         regime = {"status": "Neutral", "score": 0, "details": {}}
@@ -25,32 +26,35 @@ class AlphaStrategyDLC:
         try:
             if fred_key:
                 url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={fred_key}&file_type=json&sort_order=desc&limit=1"
-                r = requests.get(url, timeout=5).json()
+                r = requests.get(url, timeout=3).json()
                 rate = float(r['observations'][0]['value'])
             else:
                 rate = 4.0 # Fallback
         except:
-            rate = 4.0 # Fallback
+            rate = 4.0 
             
         # 2. 抓取市場數據 (銅, 金, VIX)
         try:
             # HG=F (銅), GC=F (金), ^VIX
             data = yf.download(['HG=F', 'GC=F', '^VIX'], period="5d", progress=False)['Close']
-            copper = data['HG=F'].iloc[-1]
-            gold = data['GC=F'].iloc[-1]
-            vix = data['^VIX'].iloc[-1]
             
-            cg_ratio = copper / gold
+            # 處理 MultiIndex (新版 yfinance 可能回傳多層索引)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+                
+            copper = data.get('HG=F', pd.Series([0])).iloc[-1]
+            gold = data.get('GC=F', pd.Series([1])).iloc[-1]
+            vix = data.get('^VIX', pd.Series([20])).iloc[-1]
+            
+            cg_ratio = copper / gold if gold > 0 else 0
         except:
             copper, gold, cg_ratio, vix = 0, 0, 0, 20
             
-        # 3. 綜合判定
-        # 簡單邏輯：利率高 + VIX高 = 緊縮 (Risk Off)
-        # 銅金比上漲 = 復甦 (Risk On)
+        # 3. 綜合判定 (簡易計分卡)
         score = 0
-        if rate < 4.5: score += 1
-        if vix < 20: score += 1
-        if cg_ratio > 0.0018: score += 1 # 經驗值
+        if rate < 4.5: score += 1      # 利率低於 4.5% = +1
+        if vix < 20: score += 1        # VIX 平穩 = +1
+        if cg_ratio > 0.0018: score += 1 # 銅金比上升 = +1
         
         regime['details'] = {
             "Rate (10Y)": rate,
@@ -90,12 +94,12 @@ class AlphaStrategyDLC:
         return pd.Series(obv, index=df.index)
 
     # ==========================================
-    # 🧮 凱利公式 (含宏觀權重)
+    # 🧮 凱利公式 (含宏觀加權)
     # ==========================================
     def calculate_kelly_fraction(self, price_series, macro_score=3):
         if len(price_series) < 30: return 0.0
         
-        returns = price_series.pct_change().dropna().tail(252) # 一年
+        returns = price_series.pct_change().dropna().tail(252) # 過去一年
         if len(returns) == 0: return 0.0
 
         wins = returns[returns > 0]
@@ -111,139 +115,176 @@ class AlphaStrategyDLC:
         if avg_loss == 0: return 0.5
         b = avg_win / avg_loss
         
+        # 原始 Kelly
         f = p - (q / b)
         
-        # 基礎 Kelly (Half)
+        # 安全係數 (Half Kelly)
         base_kelly = max(0.0, min(f * 0.5, 0.4))
         
         # 🔥 宏觀加權 (Money Flow Adjustment)
         # Score 3 (Risk On) -> 100% Kelly
-        # Score 0 (Risk Off) -> 50% Kelly
-        multiplier = 0.5 + (macro_score / 6) # 0.5 ~ 1.0
+        # Score 0 (Risk Off) -> 50% Kelly (保守)
+        multiplier = 0.5 + (macro_score / 6) # 範圍 0.5 ~ 1.0
         
         return base_kelly * multiplier
 
     # ==========================================
-    # ⏳ 終極回測引擎
+    # ⏳ 驗屍官回測引擎 (含下架模擬)
     # ==========================================
-    def run_advanced_backtest(self, targets, monthly_budget, start_date):
-        # 1. 下載所有數據 (含宏觀指標)
-        macro_tickers = ['^VIX', '^TNX', 'HG=F', 'GC=F']
+    def run_advanced_backtest(self, targets_info, monthly_budget, start_date, end_date):
+        """
+        targets_info: dict, key=ticker, value={'delist_date': 'YYYY-MM-DD'}
+        """
+        targets = list(targets_info.keys())
+        macro_tickers = ['^VIX', '^TNX']
         all_tickers = targets + macro_tickers
         
-        data = yf.download(all_tickers, start=start_date, progress=False)
+        # 1. 下載數據
+        # 注意：對於已下架股票，Yahoo 可能回傳空值，我們會用 last_known_prices 模擬歸零過程
+        data = yf.download(all_tickers, start=start_date, end=end_date, progress=False)
         
-        # 處理 MultiIndex
         if 'Close' in data.columns: closes = data['Close']
         else: closes = data
         
-        if 'Volume' in data.columns: vols = data['Volume']
-        else: vols = pd.DataFrame(0, index=closes.index, columns=closes.columns)
+        # 處理 MultiIndex
+        if isinstance(closes.columns, pd.MultiIndex):
+            closes.columns = closes.columns.get_level_values(0)
 
-        # 2. 預計算指標 (向量化加速)
-        # 宏觀指標
+        # 簡單填充 (Forward Fill) 避免假日空值
+        closes = closes.ffill()
+
+        # 宏觀數據提取
         try:
-            cg_ratio = closes['HG=F'] / closes['GC=F']
-            tnx = closes['^TNX']
-            vix = closes['^VIX']
+            tnx = closes.get('^TNX', pd.Series(4.0, index=closes.index))
+            vix = closes.get('^VIX', pd.Series(20.0, index=closes.index))
         except:
-            return None # 數據缺失
+            return None # 關鍵數據缺失
             
-        # MA200 & OBV
-        mas = closes.rolling(200).mean()
-        
-        # 3. 逐日模擬
+        # 2. 變數初始化
         portfolio_history = []
         agent_holdings = {t: 0.0 for t in targets}
         agent_cash = 0.0
         dca_holdings = {t: 0.0 for t in targets}
         total_invested = 0.0
         
-        valid_dates = closes.index[200:]
-        if len(valid_dates) == 0: return None
+        # 價格記憶體 (修復數據缺失導致的歸零 Bug)
+        last_known_prices = {t: 0.0 for t in targets}
+        
+        valid_dates = closes.index
+        if len(valid_dates) < 30: return None
 
-        # 發薪日
+        # 發薪日邏輯
         df_cal = pd.DataFrame(index=valid_dates)
         df_cal['YM'] = df_cal.index.to_period('M')
         df_reset = df_cal.reset_index()
         date_col = df_reset.columns[0]
         salary_dates = df_reset.groupby('YM')[date_col].first().values
+        
+        alloc_per_asset = monthly_budget / len(targets)
 
-        alloc = monthly_budget / len(targets)
-
+        # 3. 逐日模擬
         for date in valid_dates:
-            # A. Mark to Market
-            daily_agent = agent_cash
-            daily_dca = 0.0
+            current_date_str = date.strftime('%Y-%m-%d')
             
-            # 當日宏觀分數計算
-            d_rate = tnx.loc[date]
-            d_vix = vix.loc[date]
-            d_cg = cg_ratio.loc[date]
-            
+            # 宏觀狀態判定 (當日)
+            d_rate = tnx.loc[date] if date in tnx.index else 4.0
+            d_vix = vix.loc[date] if date in vix.index else 20.0
             macro_score = 0
             if d_rate < 4.5: macro_score += 1
             if d_vix < 20: macro_score += 1
-            if d_cg > 0.0018: macro_score += 1 # 簡化門檻
+            if d_vix < 15: macro_score += 1 # 簡化
             
-            # 資產計價
+            # --- A. 更新價格 (Mark to Market) ---
+            daily_agent = agent_cash
+            daily_dca = 0.0
             current_prices = {}
+            
             for t in targets:
-                try:
-                    p = float(closes.loc[date, t])
-                    if np.isnan(p) or p <= 0: p = 0
-                    current_prices[t] = p
+                # 檢查下架
+                delist_date = targets_info[t].get('delist_date')
+                is_dead = False
+                if delist_date and current_date_str >= delist_date:
+                    is_dead = True
+                    p = 0.0 # 強制歸零
+                else:
+                    try:
+                        p = float(closes.loc[date, t])
+                        if np.isnan(p) or p <= 0: 
+                            p = last_known_prices[t] # 使用記憶價格
+                        else: 
+                            last_known_prices[t] = p # 更新記憶
+                    except: 
+                        p = last_known_prices[t]
+                
+                current_prices[t] = p
+                
+                # 如果下架，持倉價值歸零
+                if is_dead:
+                    agent_holdings[t] = 0
+                    dca_holdings[t] = 0
+                
+                if p > 0:
                     daily_agent += agent_holdings[t] * p
                     daily_dca += dca_holdings[t] * p
-                except: pass
             
             portfolio_history.append({
                 "Date": date,
                 "Agent": daily_agent,
                 "DCA": daily_dca,
-                "Cost": total_invested,
-                "MacroScore": macro_score
+                "Cost": total_invested
             })
             
-            # B. 發薪日
+            # --- B. 發薪日入金 ---
             if date in salary_dates:
                 agent_cash += monthly_budget
                 total_invested += monthly_budget
                 for t in targets:
-                    if current_prices.get(t, 0) > 0:
-                        dca_holdings[t] += alloc / current_prices[t]
-                        
-            # C. Agent 操作
-            # 隨機順序
+                    # 只有沒死且有價格才買入
+                    delist_date = targets_info[t].get('delist_date')
+                    is_dead_now = delist_date and current_date_str >= delist_date
+                    
+                    if not is_dead_now and current_prices.get(t, 0) > 0:
+                        dca_holdings[t] += alloc_per_asset / current_prices[t]
+
+            # --- C. Agent 策略 (含止損 & Kelly) ---
+            # 隨機打散交易順序
             shuffled = list(targets)
             np.random.shuffle(shuffled)
             
             for t in shuffled:
+                # 若已下市，跳過
+                delist_date = targets_info[t].get('delist_date')
+                if delist_date and current_date_str >= delist_date: continue
+
                 p = current_prices.get(t, 0)
                 if p <= 0: continue
                 
-                ma = mas.loc[date, t]
-                if pd.isna(ma): continue
+                # 計算歷史年線
+                past = closes[t].loc[:date]
+                if len(past) < 201: continue
+                ma200 = past.iloc[-201:-1].mean()
+                if pd.isna(ma200) or ma200 == 0: continue
                 
-                # OBV 趨勢確認 (過去20天 OBV 是否上升)
-                # 這裡簡化：只要價格在年線上，且 VIX 不高，我們就買
-                # 但加入 Macro Score 調整買入量
+                # 止損邏輯 (Stop Loss)
+                is_uptrend = p > ma200
+                is_panic = d_vix > 30 # 恐慌時不輕易止損，反而可能買進
                 
-                signal = (p > ma) or (d_vix > 30)
+                # 持有中 且 跌破年線 且 無恐慌 -> 賣出 (止損)
+                if (not is_uptrend) and (not is_panic) and (agent_holdings[t] > 0):
+                    sell_val = agent_holdings[t] * p
+                    agent_cash += sell_val
+                    agent_holdings[t] = 0.0
                 
-                if signal and agent_cash > 100:
-                    # 計算 Kelly (過去一年數據)
-                    # 為了回測速度，這裡做簡化 Kelly 估計，或您可以呼叫 self.calculate_kelly
-                    # 使用 self.calculate_kelly_fraction 會比較慢但準確
+                # 買入邏輯 (Buy)
+                elif (is_uptrend or is_panic) and agent_cash > 100:
+                    # 計算 Kelly (含宏觀加權)
+                    kelly = self.calculate_kelly_fraction(past.iloc[-252:], macro_score)
+                    amt = agent_cash * kelly
                     
-                    past_prices = closes[t].loc[:date].tail(252)
-                    k_frac = self.calculate_kelly_fraction(past_prices, macro_score)
-                    
-                    amt = agent_cash * k_frac
-                    if amt > 500:
+                    if amt > 500: # 最小交易金額
                         agent_holdings[t] += amt / p
                         agent_cash -= amt
-                        
+
         # 4. 結算
         df_hist = pd.DataFrame(portfolio_history).set_index("Date")
         if df_hist.empty: return None
@@ -251,6 +292,7 @@ class AlphaStrategyDLC:
         final_agent = df_hist['Agent'].iloc[-1]
         final_dca = df_hist['DCA'].iloc[-1]
         years = (df_hist.index[-1] - df_hist.index[0]).days / 365.25
+        if years <= 0: years = 0.01
         
         agent_cagr = (final_agent / total_invested) ** (1/years) - 1 if total_invested > 0 else 0
         dca_cagr = (final_dca / total_invested) ** (1/years) - 1 if total_invested > 0 else 0
