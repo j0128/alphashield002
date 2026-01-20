@@ -10,51 +10,75 @@ class AlphaStrategyDLC:
     def __init__(self):
         self.version = "3.7 (Macro + Kelly + Delist Mode)"
 
-    # ==========================================
-    # 📡 宏觀數據 (FRED + Market)
+# ==========================================
+    # 📡 宏觀數據 (FRED 優先 + Yahoo 輔助)
     # ==========================================
     def get_macro_regime(self, fred_key):
         """
         獲取宏觀狀態：
-        1. 利率 (FRED DGS10)
-        2. 銅金比 (Copper/Gold) - 經濟體溫
-        3. VIX - 恐慌指數
+        1. 利率 (FRED: DGS10)
+        2. VIX (FRED: VIXCLS) -> 這是修復重點
+        3. 銅金比 (Yahoo: HG=F/GC=F)
         """
         regime = {"status": "Neutral", "score": 0, "details": {}}
         
-        # 1. 抓取 FRED 10年美債
+        # 預設值 (防呆)
+        rate = 4.0
+        vix = 20.0
+        copper = 0.0
+        gold = 0.0
+        cg_ratio = 0.0
+        
+        # --- 1. 連線 FRED (最穩定的官方源) ---
+        if fred_key:
+            try:
+                # 抓利率 (DGS10)
+                u1 = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={fred_key}&file_type=json&sort_order=desc&limit=1"
+                r1 = requests.get(u1, timeout=3).json()
+                if 'observations' in r1 and r1['observations']:
+                    val = r1['observations'][0]['value']
+                    if val != ".": rate = float(val)
+
+                # 🔥 抓 VIX (VIXCLS) -> 修復抓不到的問題
+                u2 = f"https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={fred_key}&file_type=json&sort_order=desc&limit=1"
+                r2 = requests.get(u2, timeout=3).json()
+                if 'observations' in r2 and r2['observations']:
+                    val = r2['observations'][0]['value']
+                    if val != ".": vix = float(val)
+            except Exception as e:
+                print(f"⚠️ FRED 連線部分失敗: {e}")
+
+        # --- 2. 連線 Yahoo (只抓銅金比，或當 FRED 失敗時的備用) ---
         try:
-            if fred_key:
-                url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={fred_key}&file_type=json&sort_order=desc&limit=1"
-                r = requests.get(url, timeout=3).json()
-                rate = float(r['observations'][0]['value'])
-            else:
-                rate = 4.0 # Fallback
-        except:
-            rate = 4.0 
+            # 嘗試抓取
+            tickers = ['HG=F', 'GC=F']
+            # 如果 FRED 沒抓到 VIX，就試試 Yahoo 的 ^VIX
+            if vix == 20.0: tickers.append('^VIX')
             
-        # 2. 抓取市場數據 (銅, 金, VIX)
-        try:
-            # HG=F (銅), GC=F (金), ^VIX
-            data = yf.download(['HG=F', 'GC=F', '^VIX'], period="5d", progress=False)['Close']
+            data = yf.download(tickers, period="5d", progress=False)['Close']
             
-            # 處理 MultiIndex (新版 yfinance 可能回傳多層索引)
+            # 處理 MultiIndex
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
-                
+
+            # 銅金比
             copper = data.get('HG=F', pd.Series([0])).iloc[-1]
             gold = data.get('GC=F', pd.Series([1])).iloc[-1]
-            vix = data.get('^VIX', pd.Series([20])).iloc[-1]
+            if gold > 0: cg_ratio = copper / gold
             
-            cg_ratio = copper / gold if gold > 0 else 0
-        except:
-            copper, gold, cg_ratio, vix = 0, 0, 0, 20
+            # 如果 FRED 失敗，用 Yahoo 的 VIX 補位
+            if '^VIX' in tickers:
+                y_vix = data.get('^VIX', pd.Series([np.nan])).iloc[-1]
+                if not pd.isna(y_vix): vix = y_vix
+                
+        except Exception as e:
+            print(f"⚠️ Yahoo 連線異常: {e}")
             
-        # 3. 綜合判定 (簡易計分卡)
+        # --- 3. 綜合判定 (簡易計分卡) ---
         score = 0
-        if rate < 4.5: score += 1      # 利率低於 4.5% = +1
-        if vix < 20: score += 1        # VIX 平穩 = +1
-        if cg_ratio > 0.0018: score += 1 # 銅金比上升 = +1
+        if rate < 4.5: score += 1      # 利率低於 4.5% (寬鬆)
+        if vix < 20: score += 1        # VIX 平穩 (安穩)
+        if cg_ratio > 0.0018: score += 1 # 銅金比高 (景氣好)
         
         regime['details'] = {
             "Rate (10Y)": rate,
