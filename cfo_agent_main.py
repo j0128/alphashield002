@@ -13,7 +13,7 @@ try:
 except:
     dlc_loaded = False
 
-st.set_page_config(page_title="CFO 3.7 - Quant Master", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="CFO 3.8 - Quant Master", page_icon="🦅", layout="wide")
 
 # ==========================================
 # 🔑 讀取 Secrets
@@ -21,23 +21,22 @@ st.set_page_config(page_title="CFO 3.7 - Quant Master", page_icon="🦅", layout
 try:
     FRED_KEY = st.secrets["FRED_API_KEY"]
 except:
-    # 這裡放一個提示，如果沒設 secrets 也不要崩潰，只是宏觀功能會受限
     FRED_KEY = None 
-    # st.warning("⚠️ 未偵測到 FRED API Key，請在 secrets.toml 中設定以啟用完整宏觀功能。")
 
 # ==========================================
 # 💻 UI 主介面
 # ==========================================
-st.title("🦅 CFO 3.7 - 量化戰情室 (Quant Master)")
+st.title("🦅 CFO 3.8 - 量化戰情室 (Quant Master)")
 st.caption(f"Engine: {dlc.version if dlc_loaded else 'N/A'} | Target: CAGR 30% | Stop-Loss: Active")
 
 with st.sidebar:
     st.header("📂 實驗室設定")
     
-    # 1. CSV 上傳 (支援下架日期)
-    uploaded_file = st.file_uploader("上傳資產名單 (CSV)", type=['csv'], help="欄位: Code, DelistDate (選填)")
-    
     targets_info = {} 
+    
+    # --- 1. CSV 上傳區 ---
+    st.subheader("1. 批次匯入 (CSV)")
+    uploaded_file = st.file_uploader("上傳資產名單", type=['csv'], help="欄位: Code, DelistDate (選填)")
     
     if uploaded_file:
         df_up = pd.read_csv(uploaded_file)
@@ -48,20 +47,35 @@ with st.sidebar:
         
         if code_col:
             for _, row in df_up.iterrows():
-                t = str(row[code_col]).strip()
+                t = str(row[code_col]).strip().upper() # 強制轉大寫
                 d_date = None
                 if delist_col and pd.notna(row[delist_col]):
                     d_date = str(row[delist_col]).strip()
                 targets_info[t] = {'delist_date': d_date}
-    else:
-        # 預設名單 (含測試用下架股)
+
+    # --- 2. 手動輸入區 (混合模式) ---
+    st.subheader("2. 手動輸入 / 補強")
+    # 如果 CSV 有東西，預設值留空；如果沒 CSV，給預設範例
+    default_text = "" if targets_info else "NVDA, AMD, META, BTC-USD"
+    user_in = st.text_area("輸入代號 (逗號分隔)", value=default_text, height=100)
+    
+    if user_in:
+        manual_list = [x.strip().upper() for x in user_in.split(',') if x.strip()]
+        for t in manual_list:
+            # 如果 CSV 已經有這個代號，手動輸入的不會覆蓋它 (保留 CSV 的下架設定)
+            if t not in targets_info:
+                targets_info[t] = {'delist_date': None}
+
+    # 防呆：如果兩者都空，給預設範例
+    if not targets_info:
         def_targets = ["NVDA", "AMD", "META", "BTC-USD", "SIVB"]
         for t in def_targets:
             d = '2023-03-10' if t == 'SIVB' else None
             targets_info[t] = {'delist_date': d}
 
-    # 顯示目前名單狀態
-    with st.expander("查看目前監測名單"):
+    # 顯示最終監測名單 (可摺疊)
+    count = len(targets_info)
+    with st.expander(f"📊 目前監測名單 ({count} 檔)"):
         st.json(targets_info)
 
     st.divider()
@@ -74,7 +88,6 @@ if dlc_loaded:
         regime = dlc.get_macro_regime(FRED_KEY)
         
     det = regime['details']
-    # 顯示三個關鍵指標
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("宏觀狀態", regime['status'], f"Score: {regime['score']}/3")
     m2.metric("10Y 美債 (FRED)", f"{det['Rate (10Y)']:.2f}%", "高於4.5%為緊縮")
@@ -108,10 +121,11 @@ with tab1:
                     closes = data
                     vols = data # 假設無量
                 
+                # 處理 MultiIndex
                 if isinstance(closes.columns, pd.MultiIndex):
                     closes.columns = closes.columns.get_level_values(0)
-                    if isinstance(vols, pd.DataFrame):
-                        vols.columns = vols.columns.get_level_values(0)
+                if isinstance(vols, pd.DataFrame) and isinstance(vols.columns, pd.MultiIndex):
+                    vols.columns = vols.columns.get_level_values(0)
                 
                 report = []
                 pool = monthly_budget + current_cash
@@ -119,7 +133,14 @@ with tab1:
                 
                 for t in active_targets:
                     try:
-                        prices = closes[t].dropna()
+                        # 處理單一 ticker 下載時並非 DataFrame 的情況
+                        if len(active_targets) == 1:
+                            prices = closes.dropna()
+                            volume = vols.dropna()
+                        else:
+                            prices = closes[t].dropna()
+                            volume = vols[t].dropna() if t in vols else pd.Series()
+
                         if prices.empty: continue
                         
                         curr = prices.iloc[-1]
@@ -127,8 +148,7 @@ with tab1:
                         
                         # OBV
                         obv_sig = "N/A"
-                        if isinstance(vols, pd.DataFrame) and t in vols.columns:
-                            volume = vols[t].dropna()
+                        if not volume.empty and len(volume) == len(prices):
                             obv = dlc.calculate_obv(prices, volume)
                             if len(obv) > 20:
                                 slope = obv.diff(20).iloc[-1]
@@ -151,7 +171,7 @@ with tab1:
                             "年線": ma200, 
                             "資金流 (OBV)": obv_sig,
                             "狀態": status,
-                            "Kelly% (含宏觀)": f"{kelly*100:.1f}%", 
+                            "Kelly%": f"{kelly*100:.1f}%", 
                             "建議投入": amt
                         })
                     except: pass
@@ -214,7 +234,7 @@ with tab2:
                     if d_date and s_str <= d_date <= e_str:
                         d_dt = pd.to_datetime(d_date)
                         ax.axvline(x=d_dt, color='black', linestyle=':', alpha=0.5)
-                        ax.text(d_dt, df['Agent'].max()*0.5, f" {t} 死亡", rotation=90, color='red')
+                        ax.text(d_dt, df['Agent'].max()*0.5, f" {t} DELIST", rotation=90, color='red')
 
                 ax.set_title(f"Simulation: {s_str} ~ {e_str}")
                 ax.set_ylabel("Total Value (USD)")
