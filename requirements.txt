@@ -3,7 +3,7 @@ yfinance
 pandas
 numpy
 fredapi
-plotly
+matplotlib
 scikit-learn
 requests
 xgboost
